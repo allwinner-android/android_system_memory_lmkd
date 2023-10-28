@@ -122,9 +122,9 @@
  */
 #define PSI_WINDOW_SIZE_MS 1000
 /* Polling period after PSI signal when pressure is high */
-#define PSI_POLL_PERIOD_SHORT_MS 10
+#define PSI_POLL_PERIOD_SHORT_MS 200
 /* Polling period after PSI signal when pressure is low */
-#define PSI_POLL_PERIOD_LONG_MS 100
+#define PSI_POLL_PERIOD_LONG_MS 1000
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
@@ -205,9 +205,9 @@ static int64_t filecache_min_kb;
 static bool use_psi_monitors = false;
 static int kpoll_fd;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
-    { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
-    { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
-    { PSI_FULL, 70 },    /* 70ms out of 1sec for complete stall */
+    { PSI_SOME, 200 },    /* 70ms out of 1sec for partial stall */
+    { PSI_SOME, 200 },   /* 100ms out of 1sec for partial stall */
+    { PSI_FULL, 500 },    /* 70ms out of 1sec for complete stall */
 };
 
 static android_log_context ctx;
@@ -274,6 +274,7 @@ static int lowmem_adj[MAX_TARGETS];
 static int lowmem_minfree[MAX_TARGETS];
 static int lowmem_targets_size;
 
+static char* whitelist;
 /* Fields to parse in /proc/zoneinfo */
 /* zoneinfo per-zone fields */
 enum zoneinfo_zone_field {
@@ -1887,6 +1888,37 @@ static int vmstat_parse(union vmstat *vs) {
     return 0;
 }
 
+static char* get_lmkd_whitelist() {
+    char path[PATH_MAX];
+    char line[4096];
+    int fd;
+    char *cp;
+    ssize_t ret;
+    char *list;
+
+    /* gid containing AID_READPROC required */
+    snprintf(path, PATH_MAX, "/system/etc/lmkd_whitelist");
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1)
+        return NULL;
+    ret = read_all(fd, line, sizeof(line) - 1);
+    close(fd);
+    if (ret <= 0) {
+        return NULL;
+    }
+    list = static_cast<char*>(malloc(ret*2));
+    memset(list, 0, ret*2);
+    cp = strtok(line, "\n");
+    while(cp != NULL){
+        strcat(list,cp);
+        strcat(list, ";");
+        cp = strtok(NULL, "\n");
+    }
+    ALOGW("LMKD : whitelist %s", list);
+    return list;
+
+}
+
 enum wakeup_reason {
     Event,
     Polling
@@ -2110,6 +2142,27 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
     maxevents++;
 }
 
+static int strsearch(char *name, char *list){
+  int retval = 0;
+  char *cp;
+  char *list2;
+  if(list==NULL || name==NULL) {
+    retval =0;
+  } else {
+    list2 = strdup(list);
+    cp = strtok(list2, ";");
+    while(cp) {
+      if (strstr(name,cp) != NULL) {
+        retval = 1;
+        break;
+      }
+      cp = strtok(NULL, ";");
+    }
+    free(list2);
+  }
+  return retval;
+}
+
 struct kill_info {
     enum kill_reasons kill_reason;
     const char *kill_desc;
@@ -2124,6 +2177,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int pidfd = procp->pidfd;
     uid_t uid = procp->uid;
     char *taskname;
+    char topapp[LINE_MAX];
     int r;
     int result = -1;
     struct memory_stat *mem_st;
@@ -2153,9 +2207,20 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     }
 
     taskname = proc_get_name(pid, buf, sizeof(buf));
-    // taskname will point inside buf, do not reuse buf onwards.
+
     if (!taskname) {
         goto out;
+    }
+
+    property_get("sys.lmk_top_app",topapp, "");
+    if(strstr(taskname, topapp) != NULL){
+       ALOGW("found name '%s' is top app, not kill", taskname);
+       goto out;
+    }
+
+    if(strsearch(taskname,whitelist) != 0){
+       ALOGW("found task %s in whitelist, not kill", taskname);
+       goto out;
     }
 
     mem_st = stats_read_memory_stat(per_app_memcg, pid, uid, rss_kb * 1024, swap_kb * 1024);
@@ -2842,6 +2907,9 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 
     // Calculate percent for swappinness.
     mem_pressure = (mem_usage * 100) / memsw_usage;
+    if (debug_process_killing) {
+        ALOGI("mem_pressure is %" PRId64 ", downgrade_pressure is %" PRId64 "\n", mem_pressure,downgrade_pressure);
+    }
 
     if (enable_pressure_upgrade && level != VMPRESS_LEVEL_CRITICAL) {
         // We are swapping too much.
@@ -2984,7 +3052,7 @@ static bool init_psi_monitors() {
      * use new kill strategy based on zone watermarks, free swap and thrashing stats
      */
     bool use_new_strategy =
-        property_get_bool("ro.lmk.use_new_strategy", low_ram_device || !use_minfree_levels);
+        property_get_bool("ro.lmk.use_new_strategy", false);
 
     /* In default PSI mode override stall amounts using system properties */
     if (use_new_strategy) {
@@ -3464,6 +3532,8 @@ int main(int argc, char **argv) {
 
     update_props();
 
+    whitelist = get_lmkd_whitelist();
+
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
     if (!init()) {
@@ -3495,6 +3565,8 @@ int main(int argc, char **argv) {
 
         mainloop();
     }
+
+    free(whitelist);
 
     android_log_destroy(&ctx);
 
